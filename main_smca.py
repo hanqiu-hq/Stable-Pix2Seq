@@ -16,24 +16,28 @@ from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 # from models import build_model
 from playground import build_all_model
+from timm.utils import NativeScaler
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
-
-    # training log parameters
+    parser.add_argument('--smooth', default=8, type=float,
+                        help='gaussian_smooth')
+    parser.add_argument('--dynamic_scale', default="type3", type=str,
+                        help="type1 for no scale, type 2 for dynamic scale, type 3 for dyanmic xy scale, type 4 for covariance matrix scale")
+    parser.add_argument('--amp_train', action='store_true', help='amp fp16 training or not')
     parser.add_argument('--eval_epoch', default=1, type=int)
 
     # Model name
-    parser.add_argument('--model', type=str, default="pix2seq",
+    parser.add_argument('--model', type=str, default="origin",
                         help="specify the model from playground")
 
     # Model parameters
@@ -52,7 +56,7 @@ def get_args_parser():
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
-    parser.add_argument('--dim_feedforward', default=1024, type=int,
+    parser.add_argument('--dim_feedforward', default=2048, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
                         help="Size of the embeddings (dimension of the transformer)")
@@ -60,7 +64,7 @@ def get_args_parser():
                         help="Dropout applied in the transformer")
     parser.add_argument('--nheads', default=8, type=int,
                         help="Number of attention heads inside the transformer's attentions")
-    parser.add_argument('--num_queries', default=100, type=int,
+    parser.add_argument('--num_queries', default=300, type=int,
                         help="Number of query slots")
     parser.add_argument('--pre_norm', action='store_true')
 
@@ -72,7 +76,7 @@ def get_args_parser():
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
     # * Matcher
-    parser.add_argument('--set_cost_class', default=1, type=float,
+    parser.add_argument('--set_cost_class', default=2, type=float,
                         help="Class coefficient in the matching cost")
     parser.add_argument('--set_cost_bbox', default=5, type=float,
                         help="L1 box coefficient in the matching cost")
@@ -102,6 +106,7 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--rand_target', action='store_true')
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -131,7 +136,8 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],
+                                                          find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -146,6 +152,7 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    loss_scaler = NativeScaler() if args.amp_train else utils.NoScaler()
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -183,7 +190,7 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -198,20 +205,13 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
-    min_lr = 0.0001
-    max_lr = args.lr
-    warmup = 10
-    full_epochs = args.epochs
-    warmup_lr = [min_lr + ((max_lr - min_lr) * i / warmup) for i in range(warmup)]
-    decay_lr = [max(i * args.lr / full_epochs, 0.00001) for i in range(full_epochs - warmup)]
-    decay_lr.reverse()
-    learning_rate_schedule = warmup_lr + decay_lr
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, learning_rate_schedule)
+            loss_scaler, args.clip_max_norm, amp_train=args.amp_train,
+            rand_target=args.rand_target)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']

@@ -12,8 +12,8 @@ import torch
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
-import pdb
 from util import box_ops
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -23,7 +23,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 100
     optimizer.param_groups[0]['lr'] = lr_scheduler[epoch]
     optimizer.param_groups[1]['lr'] = lr_scheduler[epoch] * 0.1
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
@@ -50,7 +50,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             idx = torch.randperm(box_label.shape[0])
             box_label = box_label[idx]
 
-
             random_box = torch.rand(num_box - box_label.shape[0], 4).to(target['boxes'])
             random_box = (random_box * (bins - 1)).int()
             random_label = torch.randint(0, 91, (num_box - box_label.shape[0], 1)).to(label)
@@ -71,7 +70,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         input_seqs = torch.cat(input_seqs, dim=0)
         output_seqs = torch.cat(output_seqs, dim=0)
         box_labels = output_seqs.flatten()
-#        with torch.cuda.amp.autocast():
+        # with torch.cuda.amp.autocast():
         if True:
            outputs = model(samples, input_seqs)
            outputs = outputs[-1].reshape(-1, 2003)
@@ -99,7 +98,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
-         
+
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
     # gather the stats from all processes
@@ -128,7 +127,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             data_loader.dataset.ann_folder,
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
-    for samples, targets in data_loader:
+
+    for samples, targets in metric_logger.log_every(data_loader, 1000, header):
         batch = len(targets)
         targets = targets[: batch // 2]
         samples.mask = samples.mask[: batch // 2, :, :]
@@ -157,6 +157,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
         if coco_evaluator is not None:
             coco_evaluator.update(res)
+
         if panoptic_evaluator is not None:
             res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)
             for i, target in enumerate(targets):
@@ -167,6 +168,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
             panoptic_evaluator.update(res_pano)
 
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
     if panoptic_evaluator is not None:
@@ -179,4 +183,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     panoptic_res = None
     if panoptic_evaluator is not None:
         panoptic_res = panoptic_evaluator.summarize()
-    return 0, coco_evaluator
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    if coco_evaluator is not None:
+        if 'bbox' in postprocessors.keys():
+            stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
+    return stats, coco_evaluator
