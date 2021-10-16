@@ -31,6 +31,8 @@ def get_args_parser():
 
     # training log parameters
     parser.add_argument('--eval_epoch', default=1, type=int)
+    parser.add_argument('--larger_jitter', action='store_true')
+    parser.add_argument('--color_tort', action='store_true')
 
     # Model name
     parser.add_argument('--model', type=str, default="pix2seq",

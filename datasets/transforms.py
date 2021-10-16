@@ -3,6 +3,7 @@
 Transforms and data augmentation for both image + bbox.
 """
 import random
+import math
 
 import PIL
 import torch
@@ -274,3 +275,97 @@ class Compose(object):
             format_string += "    {0}".format(t)
         format_string += "\n)"
         return format_string
+
+
+def compute_padded_size(desired_size, stride):
+    """Compute the padded size given the desired size and the stride.
+    The padded size will be the smallest rectangle, such that each dimension is
+    the smallest multiple of the stride which is larger than the desired
+    dimension. For example, if desired_size = (100, 200) and stride = 32,
+    the output padded_size = (128, 224).
+    Args:
+    desired_size: a `Tensor` or `int` list/tuple of two elements representing
+      [height, width] of the target output image size.
+    stride: an integer, the stride of the backbone network.
+    Returns:
+    padded_size: a `Tensor` or `int` list/tuple of two elements representing
+      [height, width] of the padded output image size.
+    """
+    if isinstance(desired_size, list) or isinstance(desired_size, tuple):
+        padded_size = [int(math.ceil(d * 1.0 / stride) * stride) for d in desired_size]
+    else:
+        padded_size = (desired_size / stride).ceil() * stride
+    return padded_size
+
+
+class LargeScaleJitter(object):
+    """
+        implementation of large scale jitter from copy_paste
+    """
+
+    def __init__(self, output_size=1333, aug_scale_min=0.3, aug_scale_max=2.0):
+        self.desired_size = torch.tensor(output_size)
+        self.aug_scale_min = aug_scale_min
+        self.aug_scale_max = aug_scale_max
+
+    def __call__(self, image, target=None):
+        image_size = image.size
+        image_size = torch.tensor(image_size[::-1])
+
+        out_desired_size = (self.desired_size * image_size / max(image_size)).round().int()
+
+        random_scale = torch.rand(1) * (self.aug_scale_max - self.aug_scale_min) + self.aug_scale_min
+        scaled_size = (random_scale * self.desired_size).round()
+
+        scale = torch.minimum(scaled_size / image_size[0], scaled_size / image_size[1])
+        scaled_size = (image_size * scale).round().int()
+
+        # Computes 2D image_scale.
+        image_scale = scaled_size / image_size
+
+        scaled_image = F.resize(image, scaled_size.tolist())
+
+        if random_scale >= 1:
+            # Selects non-zero random offset (x, y) if scaled image is larger than desired_size.
+            max_offset = scaled_size - out_desired_size
+            offset = (max_offset * torch.rand(2)).floor().int()
+            region = (offset[0].item(), offset[1].item(),
+                      out_desired_size[0].item(), out_desired_size[1].item())
+            output_image = F.crop(scaled_image, *region)
+        else:
+            padding = out_desired_size - scaled_size
+            output_image = F.pad(scaled_image, [0, 0, padding[1].item(), padding[0].item()])
+
+        ratio_height, ratio_width = image_scale
+        target = target.copy()
+        if "boxes" in target:
+            boxes = target["boxes"]
+            scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+            j, i = offset
+            max_size = torch.as_tensor([self.desired_size[1], self.desired_size[0]], dtype=torch.float32)
+            cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
+            cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+            cropped_boxes = cropped_boxes.clamp(min=0)
+            area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+            target["boxes"] = cropped_boxes.reshape(-1, 4)
+            target["area"] = area
+            target["boxes"] = scaled_boxes
+
+        if "area" in target:
+            area = target["area"]
+            scaled_area = area * (ratio_width * ratio_height)
+            target["area"] = scaled_area
+
+        target["size"] = torch.tensor(scaled_image.size[::-1])
+
+        if "masks" in target:
+            masks = target['masks']
+            masks = interpolate(
+                masks[:, None].float(), scaled_size, mode="nearest")[:, 0] > 0.5
+            masks = torch.nn.functional.pad(masks, (0, self.padded_size[0], 0, self.padded_size[1]))
+            target['masks'] = masks
+
+        if target is None:
+            return scaled_image, None
+
+        return output_image, target
