@@ -308,6 +308,68 @@ class LargeScaleJitter(object):
         self.aug_scale_min = aug_scale_min
         self.aug_scale_max = aug_scale_max
 
+    def rescale_target(self, scaled_size, image_size, target):
+        # compute rescaled targets
+        image_scale = scaled_size / image_size
+        ratio_height, ratio_width = image_scale
+        target = target.copy()
+        if "boxes" in target:
+            boxes = target["boxes"]
+            scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+            target["boxes"] = scaled_boxes
+
+        if "area" in target:
+            area = target["area"]
+            scaled_area = area * (ratio_width * ratio_height)
+            target["area"] = scaled_area
+
+        if "masks" in target:
+            masks = target['masks']
+            masks = interpolate(
+                masks[:, None].float(), scaled_size, mode="nearest")[:, 0] > 0.5
+            target['masks'] = masks
+        return target
+
+    def crop_target(self, region, target):
+        i, j, h, w = region
+        fields = ["labels", "area", "iscrowd"]
+
+        if "boxes" in target:
+            boxes = target["boxes"]
+            max_size = torch.as_tensor([w, h], dtype=torch.float32)
+            cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
+            cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+            cropped_boxes = cropped_boxes.clamp(min=0)
+            area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+            target["boxes"] = cropped_boxes.reshape(-1, 4)
+            target["area"] = area
+            fields.append("boxes")
+
+        if "masks" in target:
+            # FIXME should we update the area here if there are no boxes?
+            target['masks'] = target['masks'][:, i:i + h, j:j + w]
+            fields.append("masks")
+
+        # remove elements for which the boxes or masks that have zero area
+        if "boxes" in target or "masks" in target:
+            # favor boxes selection when defining which elements to keep
+            # this is compatible with previous implementation
+            if "boxes" in target:
+                cropped_boxes = target['boxes'].reshape(-1, 2, 2)
+                keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
+            else:
+                keep = target['masks'].flatten(1).any(1)
+
+            for field in fields:
+                target[field] = target[field][keep]
+        return target
+
+    def pad_target(self, padding, target):
+        target = target.copy()
+        if "masks" in target:
+            target['masks'] = torch.nn.functional.pad(target['masks'], (0, padding[1], 0, padding[0]))
+        return target
+
     def __call__(self, image, target=None):
         image_size = image.size
         image_size = torch.tensor(image_size[::-1])
@@ -320,52 +382,28 @@ class LargeScaleJitter(object):
         scale = torch.minimum(scaled_size / image_size[0], scaled_size / image_size[1])
         scaled_size = (image_size * scale).round().int()
 
-        # Computes 2D image_scale.
-        image_scale = scaled_size / image_size
-
         scaled_image = F.resize(image, scaled_size.tolist())
 
-        if random_scale >= 1:
+        if target is not None:
+            target = self.rescale_target(scaled_size, image_size, target)
+
+        # randomly crop or pad images
+        if random_scale > 1:
             # Selects non-zero random offset (x, y) if scaled image is larger than desired_size.
             max_offset = scaled_size - out_desired_size
             offset = (max_offset * torch.rand(2)).floor().int()
             region = (offset[0].item(), offset[1].item(),
                       out_desired_size[0].item(), out_desired_size[1].item())
             output_image = F.crop(scaled_image, *region)
+            if target is not None:
+                target = self.crop_target(region, target)
         else:
             padding = out_desired_size - scaled_size
             output_image = F.pad(scaled_image, [0, 0, padding[1].item(), padding[0].item()])
-
-        ratio_height, ratio_width = image_scale
-        target = target.copy()
-        if "boxes" in target:
-            boxes = target["boxes"]
-            scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
-            j, i = offset
-            max_size = torch.as_tensor([self.desired_size[1], self.desired_size[0]], dtype=torch.float32)
-            cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-            cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
-            cropped_boxes = cropped_boxes.clamp(min=0)
-            area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
-            target["boxes"] = cropped_boxes.reshape(-1, 4)
-            target["area"] = area
-            target["boxes"] = scaled_boxes
-
-        if "area" in target:
-            area = target["area"]
-            scaled_area = area * (ratio_width * ratio_height)
-            target["area"] = scaled_area
-
-        target["size"] = torch.tensor(scaled_image.size[::-1])
-
-        if "masks" in target:
-            masks = target['masks']
-            masks = interpolate(
-                masks[:, None].float(), scaled_size, mode="nearest")[:, 0] > 0.5
-            masks = torch.nn.functional.pad(masks, (0, self.padded_size[0], 0, self.padded_size[1]))
-            target['masks'] = masks
+            if target is not None:
+                target = self.pad_target(padding, target)
 
         if target is None:
-            return scaled_image, None
+            target["size"] = out_desired_size
 
         return output_image, target
