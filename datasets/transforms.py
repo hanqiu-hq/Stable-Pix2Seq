@@ -12,6 +12,8 @@ import torchvision.transforms.functional as F
 
 from util.box_ops import box_xyxy_to_cxcywh
 from util.misc import interpolate
+import numpy as np
+import cv2
 
 
 def crop(image, target, region):
@@ -403,7 +405,23 @@ class LargeScaleJitter(object):
             if target is not None:
                 target = self.pad_target(padding, target)
 
-        if target is None:
+        if target is not None:
             target["size"] = out_desired_size
 
         return output_image, target
+
+
+class RandomDistortion(object):
+    """
+    Distort image w.r.t hue, saturation and exposure.
+    """
+
+    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0, prob=0.5):
+        self.prob = prob
+        self.tfm = T.ColorJitter(brightness, contrast, saturation, hue)
+
+    def __call__(self, img, target=None):
+        if np.random.random() < self.prob:
+            return self.tfm(img), target
+        else:
+            return img, target
