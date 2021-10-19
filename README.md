@@ -1,6 +1,14 @@
 # Bug Fix Oct,12,2021.
 Previous data loader uses 512 image resolution rather than 1333 image resolution. New data loader has been updated. 
 
+# Causion
+please choose --output_dir for training. Otherwise, the checkpoint and log will not been stored. 
+
+# New Data augmentation following Pix2Seq (Oct 15)
+[Large Jitter and Color Augmenatation](https://github.com/poodarchu/Stable-Pix2Seq/commit/039891839c3870114ab275a357dcd14cf8a844b1) still under testing. Results will be shared later.
+
+# News on [Large Jitter and Color Augmenatation](https://github.com/poodarchu/Stable-Pix2Seq/commit/039891839c3870114ab275a357dcd14cf8a844b1) (Oct 18)
+This augmentation contain serious bug. We are rewriting a new data augmentation pipeline and will release it after fully testing. 
 # Stable-Pix2Seq
 A full-fledged version of Pix2Seq
 
@@ -41,7 +49,7 @@ path/to/coco/
 ## Training
 To train baseline Stable-Pix2Seq on a single node with 8 gpus for 300 epochs run:
 ```
-python -m torch.distributed.launch --master_port=3141 --nproc_per_node 8 --use_env main.py --coco_path ./coco/ --batch_size 4 --lr 0.0005
+python -m torch.distributed.launch --master_port=3141 --nproc_per_node 8 --use_env main.py --coco_path ./coco/ --batch_size 4 --lr 0.0005 --output_dir ./output/
 ```
 A single epoch takes 50 minutes on 8 V100, so 300 epoch training
 takes around 10 days on a single machine with 8 V100 cards.
